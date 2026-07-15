@@ -14,14 +14,14 @@ use super::limits::{
 };
 use super::metadata::metadata_for_key;
 use super::record_format::{
-    collect_entry_records, collect_file_records, collect_finalization_records,
-    load_one_from_documents, read_trajectory_header, trajectory_header_key, ChromaRecord,
-    TrajectoryHeader,
+    ChromaRecord, TrajectoryHeader, collect_entry_records, collect_file_records,
+    collect_finalization_records, load_one_from_documents, read_trajectory_header,
+    trajectory_header_key,
 };
 use chroma::{
+    ChromaCollection, ChromaHttpClient,
     client::{ChromaHttpClientOptions, ChromaRetryOptions},
     types::MetadataValue,
-    ChromaCollection, ChromaHttpClient,
 };
 use chroma_types::Collection;
 use httpmock::MockServer;
@@ -190,6 +190,24 @@ fn sample_citations_with_duplicates_and_conflicts() -> Citations {
             ("page-b".to_string(), json!(["storage", "rust"])),
         ]),
         extra: BTreeMap::from([("custom".to_string(), json!({"kept": true}))]),
+    }
+}
+
+/// Construct citations that include the empty wiki root slug everywhere slugs
+/// are used as durable logical keys.
+fn sample_citations_with_root_slug() -> Citations {
+    Citations {
+        input_ids: Vec::new(),
+        surfaced_page_ids: vec!["wiki_master:".to_string()],
+        read_page_ids: vec!["wiki_master:".to_string()],
+        final_citations: BTreeMap::from([(
+            String::new(),
+            json!(["wiki_master:", "slack_master:source"]),
+        )]),
+        new_page_slugs: vec![String::new()],
+        updated_page_slugs: Vec::new(),
+        categories_assigned: BTreeMap::from([(String::new(), json!(["system"]))]),
+        extra: BTreeMap::new(),
     }
 }
 
@@ -452,6 +470,41 @@ fn citations_roundtrip_deduplicates_orders_and_preserves_extra() -> TestResult {
 }
 
 #[test]
+/// Verifies the empty wiki root slug is a valid citation key.
+fn citations_roundtrip_root_slug() -> TestResult {
+    let tid = uuid_to_tid(Uuid::parse_str("00000000-0000-0000-0000-000000000016")?)?;
+    let citations = sample_citations_with_root_slug();
+    let mut records = Vec::new();
+    write_citations(&mut records, &tid, &citations)?;
+    let documents = documents_from_records(&records);
+
+    assert!(
+        documents.contains_key(&format!(
+            "gt/{tid}/citations/page_write_ops/{}/metadata",
+            sha256_base36(b"")?
+        )),
+        "root slug page write op should be keyed by the hash of empty bytes"
+    );
+    assert_eq!(
+        read_citations(&documents, &tid)?,
+        json!({
+            "input_ids": [],
+            "surfaced_page_ids": ["wiki_master:"],
+            "read_page_ids": ["wiki_master:"],
+            "final_citations": {
+                "": ["wiki_master:", "slack_master:source"]
+            },
+            "new_page_slugs": [""],
+            "updated_page_slugs": [],
+            "categories_assigned": {
+                "": ["system"]
+            }
+        })
+    );
+    Ok(())
+}
+
+#[test]
 /// Verifies empty citation records round-trip to the complete empty shape.
 fn empty_citations_roundtrip_to_complete_empty_shape() -> TestResult {
     let tid = uuid_to_tid(Uuid::parse_str("00000000-0000-0000-0000-000000000008")?)?;
@@ -623,18 +676,77 @@ fn citations_reject_unsupported_page_write_operation() -> TestResult {
 fn save_and_load_finalized_file_roundtrips() -> TestResult {
     let file = sample_file(Uuid::parse_str("00000000-0000-0000-0000-000000000001")?);
     let records = records_for_file(&file, WriteState::Finalized)?;
-    assert!(records
-        .iter()
-        .all(|record| record.document.len() <= VALUE_MAX_BYTES));
-    assert!(records
-        .iter()
-        .all(|record| record.id.len() <= KEY_MAX_BYTES));
-    assert!(records
-        .iter()
-        .any(|record| record.id.contains("/chunks/00001")));
+    assert!(
+        records
+            .iter()
+            .all(|record| record.document.len() <= VALUE_MAX_BYTES)
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.id.len() <= KEY_MAX_BYTES)
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.id.contains("/chunks/00001"))
+    );
 
     let documents = documents_from_records(&records);
     let loaded = load_one_from_documents(&documents, file.trajectory.id, true)?;
+    assert_eq!(serde_json::to_value(&loaded)?, serde_json::to_value(&file)?);
+    Ok(())
+}
+
+#[test]
+/// Verifies trajectory storage preserves root-slug tool calls and citations.
+fn save_and_load_file_with_root_slug_roundtrips() -> TestResult {
+    let id = Uuid::parse_str("00000000-0000-0000-0000-000000000017")?;
+    let mut file = sample_file(id);
+    file.citations = Some(sample_citations_with_root_slug());
+    file.trajectory.actions_and_observations = vec![
+        TrajectoryEntry::Action(Action {
+            tools: vec![Tool {
+                tool_schema: ToolSchema {
+                    name: "wiki_read_file".to_string(),
+                    description: "read a page".to_string(),
+                    parameters: json!({"type": "object"}),
+                    required: vec!["slug".to_string()],
+                    extra: BTreeMap::new(),
+                },
+                extra: BTreeMap::new(),
+            }],
+            params: vec![json!({"slug": ""})],
+            sources: vec![Source::new("agent")],
+            reasoning: Some("read root".to_string()),
+            reasoning_signature: None,
+        }),
+        TrajectoryEntry::Observation(Observation {
+            observations: vec!["root page".to_string()],
+            sources: vec![Source::new("wiki")],
+            tool_metadata: vec![Some(ToolCallMetadata {
+                lock_handoff: None,
+                lock_waits: None,
+                skipped_due_to_handoff: None,
+                surfaced_page_ids: Some(vec!["wiki_master:".to_string()]),
+                read_page_id: Some("wiki_master:".to_string()),
+                page_id: Some("wiki_master:".to_string()),
+                record_ids: None,
+                todos: None,
+                op: Some("added".to_string()),
+                slug: Some(String::new()),
+                source_ids: Some(vec!["wiki_master:".to_string()]),
+                categories: Some(vec!["system".to_string()]),
+                latest_raw_source_date: None,
+                extra: BTreeMap::new(),
+            })],
+        }),
+    ];
+
+    let records = records_for_file(&file, WriteState::Finalized)?;
+    let documents = documents_from_records(&records);
+    let loaded = load_one_from_documents(&documents, file.trajectory.id, true)?;
+
     assert_eq!(serde_json::to_value(&loaded)?, serde_json::to_value(&file)?);
     Ok(())
 }
@@ -800,6 +912,148 @@ async fn create_open_trajectory_reads_absence_before_add() -> TestResult {
 
     assert_eq!(result.record_count, 2);
     assert_eq!(get_mock.calls(), 1);
+    assert_eq!(commit_mock.calls(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+/// Verifies transactional appends update headers after adding root-slug entries.
+async fn append_open_trajectory_with_root_slug_commits() -> TestResult {
+    let server = MockServer::start_async().await;
+    let collection = mocked_collection(&server);
+    let id = Uuid::parse_str("00000000-0000-0000-0000-000000000018")?;
+    let mut file = sample_file(id);
+    file.citations = Some(sample_citations_with_root_slug());
+    file.trajectory.actions_and_observations = vec![
+        TrajectoryEntry::Action(Action {
+            tools: vec![Tool {
+                tool_schema: ToolSchema {
+                    name: "wiki_read_file".to_string(),
+                    description: "read a page".to_string(),
+                    parameters: json!({"type": "object"}),
+                    required: vec!["slug".to_string()],
+                    extra: BTreeMap::new(),
+                },
+                extra: BTreeMap::new(),
+            }],
+            params: vec![json!({"slug": ""})],
+            sources: vec![Source::new("agent")],
+            reasoning: Some("read root".to_string()),
+            reasoning_signature: None,
+        }),
+        TrajectoryEntry::Observation(Observation {
+            observations: vec!["root page".to_string()],
+            sources: vec![Source::new("wiki")],
+            tool_metadata: vec![Some(ToolCallMetadata {
+                lock_handoff: None,
+                lock_waits: None,
+                skipped_due_to_handoff: None,
+                surfaced_page_ids: Some(vec!["wiki_master:".to_string()]),
+                read_page_id: Some("wiki_master:".to_string()),
+                page_id: Some("wiki_master:".to_string()),
+                record_ids: None,
+                todos: None,
+                op: Some("added".to_string()),
+                slug: Some(String::new()),
+                source_ids: Some(vec!["wiki_master:".to_string()]),
+                categories: Some(vec!["system".to_string()]),
+                latest_raw_source_date: None,
+                extra: BTreeMap::new(),
+            })],
+        }),
+    ];
+
+    let entries = file.trajectory.actions_and_observations.clone();
+    file.trajectory.actions_and_observations.clear();
+    file.duration_seconds = None;
+    file.status = None;
+    file.error = None;
+    file.usage = None;
+    file.citations = None;
+    file.final_todos = None;
+
+    let tid = uuid_to_tid(file.trajectory.id)?;
+    let header_key = trajectory_header_key(file.trajectory.id)?;
+    let header_document = records_for_file(&file, WriteState::Open)?
+        .into_iter()
+        .find(|record| record.id == header_key)
+        .ok_or_else(|| test_error(format!("missing header record {header_key}")))?
+        .document;
+
+    let mut entry_records = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        collect_entry_records(&mut entry_records, &tid, index, entry)?;
+    }
+    let entry_ids = entry_records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+
+    let get_path = collection_path(&collection, "conditional/get");
+    let commit_path = collection_path(&collection, "conditional/commit");
+
+    let header_get_mock = server
+        .mock_async(|when, then| {
+            when.method("POST").path(&get_path).json_body(json!({
+                "ids": [header_key],
+                "where": null,
+                "where_document": null,
+                "limit": 1,
+                "offset": 0,
+                "include": ["documents", "metadatas"],
+                "read_token": null,
+            }));
+            then.status(200).json_body(json!({
+                "ids": [header_key],
+                "embeddings": null,
+                "documents": [header_document],
+                "uris": null,
+                "metadatas": null,
+                "include": ["documents", "metadatas"],
+                "read_token": 42,
+            }));
+        })
+        .await;
+    let absence_get_mock = server
+        .mock_async(|when, then| {
+            when.method("POST").path(&get_path).json_body(json!({
+                "ids": entry_ids,
+                "where": null,
+                "where_document": null,
+                "limit": null,
+                "offset": 0,
+                "include": [],
+                "read_token": 42,
+            }));
+            then.status(200).json_body(json!({
+                "ids": [],
+                "embeddings": null,
+                "documents": null,
+                "uris": null,
+                "metadatas": null,
+                "include": [],
+                "read_token": 42,
+            }));
+        })
+        .await;
+    let commit_mock = server
+        .mock_async(|when, then| {
+            when.method("POST").path(commit_path);
+            then.status(200).json_body(json!({
+                "first_inserted_record_offset": 19,
+                "record_count": entry_records.len() + 1,
+            }));
+        })
+        .await;
+
+    let mut txn = collection.conditional();
+    let next_entry = chroma_extend_open_trajectory_at(&mut txn, id, 0, &entries).await?;
+    let result = txn.commit().await?;
+
+    assert_eq!(next_entry, entries.len());
+    assert_eq!(result.record_count, entry_records.len() + 1);
+    assert_eq!(header_get_mock.calls(), 1);
+    assert_eq!(absence_get_mock.calls(), 1);
     assert_eq!(commit_mock.calls(), 1);
     Ok(())
 }

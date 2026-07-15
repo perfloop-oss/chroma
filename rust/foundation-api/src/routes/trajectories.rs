@@ -9,9 +9,9 @@
 use std::future::Future;
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::HeaderMap,
-    Json,
 };
 use chroma_error::{ChromaError, ErrorCodes};
 use serde::{Deserialize, Serialize};
@@ -25,10 +25,10 @@ use crate::{
     routes::{caller_token, whoami::whoami_and_authorize},
     server::FoundationApiServer,
     trajectories::{
-        append_open_generate_trajectory, create_open_generate_trajectory,
-        finalize_open_generate_trajectory, load_generate_trajectory, save_generate_trajectory,
         Action, AppendTrajectoryEntriesRequest, GenerateTrajectoryFile, Observation,
         ToolCallMetadata, TrajectoryEntry, TrajectoryError, TrajectoryWriteResponse,
+        append_open_generate_trajectory, create_open_generate_trajectory,
+        finalize_open_generate_trajectory, load_generate_trajectory, save_generate_trajectory,
     },
 };
 
@@ -512,6 +512,21 @@ mod tests {
                     write_state: crate::trajectories::WriteState::Finalized,
                 })
                 .code(),
+                TrajectoryRouteError::Trajectory(TrajectoryError::Chroma(
+                    ChromaHttpClientError::ConditionalTransactionError(
+                        chroma_types::ConditionalTransactionError::AddRequiresKnownAbsent {
+                            id: "entry-record".to_string(),
+                        },
+                    ),
+                ))
+                .code(),
+                TrajectoryRouteError::Trajectory(TrajectoryError::Chroma(
+                    ChromaHttpClientError::ApiError(
+                        "ConditionalWriteConflictError".to_string(),
+                        reqwest::StatusCode::CONFLICT,
+                    ),
+                ))
+                .code(),
             ],
             vec![
                 ErrorCodes::Internal,
@@ -525,6 +540,8 @@ mod tests {
                 ErrorCodes::InvalidArgument,
                 ErrorCodes::FailedPrecondition,
                 ErrorCodes::FailedPrecondition,
+                ErrorCodes::FailedPrecondition,
+                ErrorCodes::InvalidArgument,
                 ErrorCodes::FailedPrecondition,
             ]
         );

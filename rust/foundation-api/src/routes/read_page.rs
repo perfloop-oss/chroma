@@ -11,13 +11,13 @@
 
 use crate::routes::links::page_url;
 use crate::routes::{caller_token, whoami::whoami_and_authorize};
-use crate::wiki::page::{meta_int, meta_str, meta_str_array};
 use crate::wiki::WikiClientError;
+use crate::wiki::page::{meta_int, meta_str, meta_str_array};
 use crate::{auth::AuthzAction, errors::ServerError, server::FoundationApiServer};
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{Json, extract::State, http::HeaderMap};
+use chroma::ChromaCollection;
 use chroma::client::ChromaHttpClientError;
 use chroma::types::{Key, SearchPayload, SearchResponse};
-use chroma::ChromaCollection;
 use chroma_error::{ChromaError, ChromaValidationError, ErrorCodes};
 use chroma_types::{
     Metadata, MetadataComparison, MetadataExpression, MetadataValue, PrimitiveOperator, Where,
@@ -28,8 +28,7 @@ use validator::Validate;
 /// Request body for `POST /api/read-page`.
 #[derive(Debug, Deserialize, Validate)]
 pub struct ReadPageRequest {
-    /// Slug of the wiki page to reconstruct in full.
-    #[validate(length(min = 1, message = "slug must not be empty"))]
+    /// Slug of the wiki page to reconstruct in full. Empty string is the wiki root.
     pub slug: String,
 }
 
@@ -332,14 +331,14 @@ mod tests {
     }
 
     #[test]
-    fn read_page_request_rejects_empty_slug() {
+    fn read_page_request_allows_root_slug() {
         let valid: ReadPageRequest =
             serde_json::from_value(serde_json::json!({ "slug": "my-page" })).expect("deserialize");
         assert!(valid.validate().is_ok());
 
-        let empty: ReadPageRequest =
+        let root: ReadPageRequest =
             serde_json::from_value(serde_json::json!({ "slug": "" })).expect("deserialize");
-        assert!(empty.validate().is_err());
+        assert!(root.validate().is_ok());
     }
 
     #[test]
